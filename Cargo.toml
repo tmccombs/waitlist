@@ -1,0 +1,11 @@
+[package]
+name = "waitlist"
+version = "0.1.0"
+authors = ["Thayne McCombs <astrothayne@gmail.com>"]
+edition = "2018"
+license = "Apache-2.0"
+keywords = ["async", "await", "waker"]
+categories = ["asynchronous", "concurrency"]
+
+[dependencies]
+crossbeam-utils = "0.7.0"
