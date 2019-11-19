@@ -1,19 +1,17 @@
 use core::cell::UnsafeCell;
+use core::mem;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use core::mem;
 use core::task::{Context, Waker};
 
 use crossbeam_utils::Backoff;
 
+extern crate alloc;
+use alloc::vec::Vec;
+
 enum Slot {
-    Available {
-        next: usize,
-    },
-    Waiting {
-        next: usize,
-        waker: Waker,
-    },
+    Available { next: usize },
+    Waiting { next: usize, waker: Waker },
     Notified,
 }
 
@@ -141,6 +139,15 @@ impl Waitlist {
     }
 }
 
+unsafe impl Send for Waitlist {}
+unsafe impl Sync for Waitlist {}
+
+impl Default for Waitlist {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Inner {
     fn add_waker(&mut self, waker: Waker) -> usize {
         let key = self.next_avail;
@@ -154,7 +161,7 @@ impl Inner {
         } else {
             self.next_avail = match self.queue.get(key) {
                 Some(&Slot::Available { next }) => next,
-                _ => unreachable!()
+                _ => unreachable!(),
             };
             self.queue[key] = entry;
         }
@@ -164,14 +171,14 @@ impl Inner {
 
     fn update(&mut self, key: usize, w: Waker) {
         let was_notified = match self.queue.get_mut(key) {
-            Some(slot@&mut Slot::Notified) => {
+            Some(slot @ &mut Slot::Notified) => {
                 *slot = Slot::Waiting {
                     next: NULL_INDEX,
                     waker: w,
                 };
                 true
             }
-            Some(&mut Slot::Waiting{ ref mut waker, ..}) => {
+            Some(&mut Slot::Waiting { ref mut waker, .. }) => {
                 *waker = w;
                 false
             }
@@ -189,14 +196,16 @@ impl Inner {
     fn remove(&mut self, key: usize, cancel: bool) -> bool {
         let entry = self.take_slot(key);
         match entry {
-            Slot::Waiting{next: next_slot, ..} => {
+            Slot::Waiting {
+                next: next_slot, ..
+            } => {
                 self.waiting_count -= 1;
                 if key == self.next_avail {
                     self.next_avail = next_slot;
                 } else {
                     let mut current = self.next_avail;
                     while current != NULL_INDEX {
-                        if let Slot::Waiting{ref mut next, ..} = self.queue[key] {
+                        if let Slot::Waiting { ref mut next, .. } = self.queue[key] {
                             if *next == key {
                                 *next = next_slot;
                                 break;
@@ -209,7 +218,7 @@ impl Inner {
                     }
                 }
                 true
-            },
+            }
             Slot::Notified => {
                 self.notified_count -= 1;
                 if cancel {
@@ -219,21 +228,23 @@ impl Inner {
                 }
                 false
             }
-            Slot::Available{..} => unreachable!("attempt to remove non-existant entry"),
+            Slot::Available { .. } => unreachable!("attempt to remove non-existant entry"),
         }
     }
 
     fn remove_if_notified(&mut self, key: usize, cx: &Context<'_>) -> bool {
         let should_remove = match self.queue[key] {
-            Slot::Waiting{ref mut waker, ..} => {
+            Slot::Waiting { ref mut waker, .. } => {
                 *waker = cx.waker().clone();
                 false
             }
             Slot::Notified => true,
-            Slot::Available{..} => unreachable!("Attempt to remove non-existant entry"),
+            Slot::Available { .. } => unreachable!("Attempt to remove non-existant entry"),
         };
         if should_remove {
-            self.queue[key] = Slot::Available { next: self.next_avail };
+            self.queue[key] = Slot::Available {
+                next: self.next_avail,
+            };
             self.next_avail = key;
             self.notified_count -= 1;
         }
@@ -264,7 +275,7 @@ impl Inner {
     }
 
     fn notify_slot(&mut self, key: usize) -> usize {
-        if let Slot::Waiting{next, waker} = mem::replace(&mut self.queue[key], Slot::Notified) {
+        if let Slot::Waiting { next, waker } = mem::replace(&mut self.queue[key], Slot::Notified) {
             waker.wake();
             next
         } else {
@@ -273,9 +284,12 @@ impl Inner {
     }
 
     fn take_slot(&mut self, key: usize) -> Slot {
-        let slot = mem::replace(&mut self.queue[key], Slot::Available {
-            next: self.next_avail,
-        });
+        let slot = mem::replace(
+            &mut self.queue[key],
+            Slot::Available {
+                next: self.next_avail,
+            },
+        );
         self.next_avail = key;
         slot
     }
@@ -285,17 +299,14 @@ impl Inner {
             // This is the first waiter, so update both ends of the queue
             self.next_waiting = key;
             self.last_waiting = key;
+        } else if let Slot::Waiting { ref mut next, .. } = self.queue[self.last_waiting] {
+            *next = key;
+            self.last_waiting = key;
         } else {
-            if let Slot::Waiting{ ref mut next, ..} = self.queue[self.last_waiting] {
-                *next = key;
-                self.last_waiting = key;
-            } else {
-                unreachable!();
-            }
+            unreachable!();
         }
         self.waiting_count += 1;
     }
-
 }
 
 struct Guard<'a> {
@@ -335,4 +346,36 @@ impl<'a> Drop for Guard<'a> {
     }
 }
 
+#[cfg(test)]
+mod mock_waker;
 
+#[cfg(test)]
+mod tests {
+    use super::mock_waker::MockWaker;
+    use super::*;
+
+    #[test]
+    fn fifo_order() {
+        const N: usize = 7;
+        let wakers: [MockWaker; N] = Default::default();
+        let waitlist = Waitlist::new();
+        for waker in wakers.iter() {
+            waitlist.insert(&waker.to_context());
+        }
+
+        for i in 0..N {
+            waitlist.notify_one();
+
+            for (j, w) in wakers.iter().enumerate() {
+                let expected = if j <= i { 1 } else { 0 };
+                assert_eq!(
+                    expected,
+                    w.notified_count(),
+                    "Incorrect notification count for waker {} after notification {}",
+                    j,
+                    i
+                );
+            }
+        }
+    }
+}
