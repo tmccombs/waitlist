@@ -36,11 +36,16 @@ const NOTIFIED: usize = 1 << 2;
 
 // Index for the `next` value of the tail of the
 // waiting queue
-const NULL_INDEX: usize = usize::max_value();
+const SENTINEL: usize = usize::max_value();
 
 pub struct Waitlist {
     flags: AtomicUsize,
     inner: UnsafeCell<Inner>,
+}
+
+pub struct WaitRef<'a> {
+    waitlist: &'a Waitlist,
+    index: usize,
 }
 
 impl Waitlist {
@@ -58,8 +63,8 @@ impl Waitlist {
                 waiting_count: 0,
                 notified_count: 0,
                 next_avail: 0,
-                next_waiting: NULL_INDEX,
-                last_waiting: NULL_INDEX,
+                next_waiting: SENTINEL,
+                last_waiting: SENTINEL,
             }),
         }
     }
@@ -73,33 +78,19 @@ impl Waitlist {
     }
 
     #[inline]
-    pub fn insert(&self, cx: &Context) -> usize {
+    pub fn insert(&self, cx: &Context) -> WaitRef<'_> {
         let waker = cx.waker().clone();
-        self.lock().add_waker(waker)
-    }
-
-    #[inline]
-    pub fn update(&self, key: usize, cx: &Context) {
-        let waker = cx.waker().clone();
-        self.lock().update(key, waker)
-    }
-
-    #[inline]
-    pub fn remove(&self, key: usize) -> bool {
-        self.lock().remove(key, false)
+        let idx = self.lock().add_waker(waker);
+        WaitRef {
+            waitlist: self,
+            index: idx,
+        }
     }
 
     // FIXME: figure out a better name for this
     #[inline]
     pub fn remove_if_notified(&self, key: usize, cx: &Context<'_>) -> bool {
         self.lock().remove_if_notified(key, cx)
-    }
-
-    #[inline]
-    pub fn cancel(&self, key: usize) -> bool {
-        //FIXME the return value here doesn't match the waker_set from async-std,
-        //figure out a better way to handle this
-        self.lock().remove(key, true)
     }
 
     #[inline]
@@ -139,6 +130,48 @@ impl Waitlist {
     }
 }
 
+impl<'a> WaitRef<'a> {
+    #[inline]
+    pub fn update(&self, cx: &Context) {
+        let waker = cx.waker().clone();
+        self.waitlist.lock().update(self.index, waker)
+    }
+
+    /// Remove waker associated with this reference from the
+    /// waitlist without triggering another notify.
+    #[inline]
+    pub fn remove(self) -> bool {
+        let was_notified = self.waitlist.lock().remove(self.index);
+        mem::forget(self); // forget self, because the default is a cancel
+        was_notified
+    }
+
+    #[inline]
+    pub fn cancel(mut self) -> bool {
+        let did_notify = self.cancel_inner();
+        mem::forget(self); // forget so we don't try removing it again
+        did_notify
+    }
+
+    fn cancel_inner(&mut self) -> bool {
+        let mut inner = self.waitlist.lock();
+        if inner.remove(self.index) {
+            inner.notify_first()
+        } else {
+            false
+        }
+    }
+}
+
+impl<'a> Drop for WaitRef<'a> {
+    #[inline]
+    fn drop(&mut self) {
+        // by default dropping a WaitRef will cancel,
+        // triggering another waker if necessary
+        self.cancel_inner();
+    }
+}
+
 unsafe impl Send for Waitlist {}
 unsafe impl Sync for Waitlist {}
 
@@ -152,7 +185,7 @@ impl Inner {
     fn add_waker(&mut self, waker: Waker) -> usize {
         let key = self.next_avail;
         let entry = Slot::Waiting {
-            next: self.next_waiting,
+            next: SENTINEL,
             waker,
         };
         if key == self.queue.len() {
@@ -173,7 +206,7 @@ impl Inner {
         let was_notified = match self.queue.get_mut(key) {
             Some(slot @ &mut Slot::Notified) => {
                 *slot = Slot::Waiting {
-                    next: NULL_INDEX,
+                    next: SENTINEL,
                     waker: w,
                 };
                 true
@@ -192,19 +225,19 @@ impl Inner {
         }
     }
 
-    #[inline]
-    fn remove(&mut self, key: usize, cancel: bool) -> bool {
+    #[cold]
+    fn remove(&mut self, key: usize) -> bool {
         let entry = self.take_slot(key);
         match entry {
             Slot::Waiting {
                 next: next_slot, ..
             } => {
                 self.waiting_count -= 1;
-                if key == self.next_avail {
-                    self.next_avail = next_slot;
+                if key == self.next_waiting {
+                    self.next_waiting = next_slot;
                 } else {
-                    let mut current = self.next_avail;
-                    while current != NULL_INDEX {
+                    let mut current = self.next_waiting;
+                    while current != SENTINEL {
                         if let Slot::Waiting { ref mut next, .. } = self.queue[key] {
                             if *next == key {
                                 *next = next_slot;
@@ -217,16 +250,11 @@ impl Inner {
                         }
                     }
                 }
-                true
+                false
             }
             Slot::Notified => {
                 self.notified_count -= 1;
-                if cancel {
-                    // If cancelling, and we were notified, wake up the next task
-                    // in the queue
-                    self.notify_first();
-                }
-                false
+                true
             }
             Slot::Available { .. } => unreachable!("attempt to remove non-existant entry"),
         }
@@ -252,7 +280,7 @@ impl Inner {
     }
 
     fn notify_first(&mut self) -> bool {
-        if self.next_waiting != NULL_INDEX {
+        if self.next_waiting != SENTINEL {
             self.next_waiting = self.notify_slot(self.next_waiting);
             self.waiting_count -= 1;
             self.notified_count += 1;
@@ -263,14 +291,14 @@ impl Inner {
     }
 
     fn notify_all(&mut self) -> bool {
-        let notified = self.next_waiting != NULL_INDEX;
+        let notified = self.next_waiting != SENTINEL;
         let mut current = self.next_waiting;
-        while current != NULL_INDEX {
+        while current != SENTINEL {
             current = self.notify_slot(current);
         }
         self.notified_count += self.waiting_count;
         self.waiting_count = 0;
-        self.next_waiting = NULL_INDEX;
+        self.next_waiting = SENTINEL;
         notified
     }
 
@@ -295,7 +323,7 @@ impl Inner {
     }
 
     fn queue_slot(&mut self, key: usize) {
-        if self.last_waiting == NULL_INDEX {
+        if self.last_waiting == SENTINEL {
             // This is the first waiter, so update both ends of the queue
             self.next_waiting = key;
             self.last_waiting = key;
@@ -354,14 +382,16 @@ mod tests {
     use super::mock_waker::MockWaker;
     use super::*;
 
+    fn add_all<'a>(wl: &'a Waitlist, wakers: &[MockWaker]) -> Vec<WaitRef<'a>> {
+        wakers.iter().map(|w| wl.insert(&w.to_context())).collect()
+    }
+
     #[test]
     fn fifo_order() {
         const N: usize = 7;
         let wakers: [MockWaker; N] = Default::default();
         let waitlist = Waitlist::new();
-        for waker in wakers.iter() {
-            waitlist.insert(&waker.to_context());
-        }
+        let _refs = add_all(&waitlist, &wakers);
 
         for i in 0..N {
             waitlist.notify_one();
@@ -377,5 +407,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn notify_all() {
+        const N: usize = 7;
+        let wakers: [MockWaker; N] = Default::default();
+        let waitlist = Waitlist::new();
+        let _refs = add_all(&waitlist, &wakers);
+        waitlist.notify_all();
+
+        for (i, w) in wakers.iter().enumerate() {
+            assert_eq!(1, w.notified_count(), "Waker {} was not notified", i);
+        }
+    }
+
+    #[test]
+    fn cancel_notifies_next() {
+        let w1 = MockWaker::new();
+        let w2 = MockWaker::new();
+        let waitlist = Waitlist::new();
+
+        let k1 = waitlist.insert(&w1.to_context());
+        let _k2 = waitlist.insert(&w2.to_context());
+
+        waitlist.notify_one();
+        assert!(k1.cancel());
+        assert_eq!(1, w2.notified_count(), "Second task wasn't notified");
     }
 }
