@@ -1,7 +1,7 @@
-use alloc::sync::Arc;
 use core::mem;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+use std::sync::Arc;
 
 pub struct MockWaker {
     inner: Inner,
