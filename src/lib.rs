@@ -1,13 +1,16 @@
 use core::cell::UnsafeCell;
+use core::future::Future;
 use core::mem;
 use core::ops::{Deref, DerefMut};
+use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use core::task::{Context, Waker};
-
-use crossbeam_utils::Backoff;
+use core::task::{Context, Poll, Waker};
 
 extern crate alloc;
+use alloc::fmt;
 use alloc::vec::Vec;
+
+use crossbeam_utils::Backoff;
 
 enum Slot {
     Available { next: usize },
@@ -46,6 +49,11 @@ pub struct Waitlist {
 pub struct WaitRef<'a> {
     waitlist: &'a Waitlist,
     index: usize,
+}
+
+pub struct WaitFuture<'a> {
+    waitlist: &'a Waitlist,
+    key: Option<usize>,
 }
 
 impl Waitlist {
@@ -87,10 +95,12 @@ impl Waitlist {
         }
     }
 
-    // FIXME: figure out a better name for this
     #[inline]
-    pub fn remove_if_notified(&self, key: usize, cx: &Context<'_>) -> bool {
-        self.lock().remove_if_notified(key, cx)
+    pub fn wait(&self) -> WaitFuture<'_> {
+        WaitFuture {
+            waitlist: self,
+            key: None,
+        }
     }
 
     #[inline]
@@ -130,6 +140,14 @@ impl Waitlist {
     }
 }
 
+impl fmt::Debug for Waitlist {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Waitlist")
+            .field("flags", &self.flags)
+            .finish()
+    }
+}
+
 impl<'a> WaitRef<'a> {
     #[inline]
     pub fn update(&self, cx: &Context) {
@@ -147,19 +165,10 @@ impl<'a> WaitRef<'a> {
     }
 
     #[inline]
-    pub fn cancel(mut self) -> bool {
-        let did_notify = self.cancel_inner();
+    pub fn cancel(self) -> bool {
+        let did_notify = self.waitlist.lock().cancel(self.index);
         mem::forget(self); // forget so we don't try removing it again
         did_notify
-    }
-
-    fn cancel_inner(&mut self) -> bool {
-        let mut inner = self.waitlist.lock();
-        if inner.remove(self.index) {
-            inner.notify_first()
-        } else {
-            false
-        }
     }
 }
 
@@ -168,7 +177,31 @@ impl<'a> Drop for WaitRef<'a> {
     fn drop(&mut self) {
         // by default dropping a WaitRef will cancel,
         // triggering another waker if necessary
-        self.cancel_inner();
+        self.waitlist.lock().cancel(self.index);
+    }
+}
+
+impl<'a> Future for WaitFuture<'a> {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(key) = self.key {
+            if self.waitlist.lock().remove_if_notified(key, cx) {
+                self.key = None;
+                return Poll::Ready(());
+            }
+        } else {
+            let waker = cx.waker().clone();
+            self.key = Some(self.waitlist.lock().add_waker(waker));
+        }
+        Poll::Pending
+    }
+}
+
+impl<'a> Drop for WaitFuture<'a> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key {
+            self.waitlist.lock().cancel(key);
+        }
     }
 }
 
@@ -260,6 +293,14 @@ impl Inner {
         }
     }
 
+    fn cancel(&mut self, key: usize) -> bool {
+        if self.remove(key) {
+            self.notify_first()
+        } else {
+            false
+        }
+    }
+
     fn remove_if_notified(&mut self, key: usize, cx: &Context<'_>) -> bool {
         let should_remove = match self.queue[key] {
             Slot::Waiting { ref mut waker, .. } => {
@@ -280,10 +321,14 @@ impl Inner {
     }
 
     fn notify_first(&mut self) -> bool {
-        if self.next_waiting != SENTINEL {
-            self.next_waiting = self.notify_slot(self.next_waiting);
+        let key = self.next_waiting;
+        if key != SENTINEL {
+            self.next_waiting = self.notify_slot(key);
             self.waiting_count -= 1;
             self.notified_count += 1;
+            if self.next_waiting == SENTINEL {
+                self.last_waiting = SENTINEL;
+            }
             true
         } else {
             false
@@ -299,6 +344,7 @@ impl Inner {
         self.notified_count += self.waiting_count;
         self.waiting_count = 0;
         self.next_waiting = SENTINEL;
+        self.last_waiting = SENTINEL;
         notified
     }
 
