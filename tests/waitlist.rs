@@ -47,6 +47,23 @@ fn notify_all() {
 }
 
 #[test]
+fn notify_any() {
+    let waitlist = Waitlist::new();
+    let w1 = MockWaker::new();
+    let k1 = waitlist.insert(&w1.to_context());
+    let w2 = MockWaker::new();
+    let _k2 = waitlist.insert(&w2.to_context());
+
+    assert!(waitlist.notify_any());
+    assert!(!waitlist.notify_any());
+    assert_eq!(1, w1.notified_count());
+    assert_eq!(0, w2.notified_count());
+    assert!(k1.remove());
+    assert!(waitlist.notify_any());
+    assert_eq!(1, w2.notified_count());
+}
+
+#[test]
 fn cancel_notifies_next() {
     let w1 = MockWaker::new();
     let w2 = MockWaker::new();

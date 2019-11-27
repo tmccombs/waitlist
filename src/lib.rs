@@ -41,6 +41,8 @@ const NOTIFIED: usize = 1 << 2;
 // waiting queue
 const SENTINEL: usize = usize::max_value();
 
+/**
+ */
 pub struct Waitlist {
     flags: AtomicUsize,
     inner: UnsafeCell<Inner>,
@@ -129,7 +131,7 @@ impl Waitlist {
             // We need check the notified_count, because
             // the number of notified tasks may have changed
             // between checking the flags and getting the lock
-            if inner.notified_count > 0 {
+            if inner.notified_count == 0 {
                 inner.notify_first()
             } else {
                 false
@@ -270,8 +272,9 @@ impl Inner {
                     self.next_waiting = next_slot;
                 } else {
                     let mut current = self.next_waiting;
+                    // find and update the previous entry in the queue
                     while current != SENTINEL {
-                        if let Slot::Waiting { ref mut next, .. } = self.queue[key] {
+                        if let Slot::Waiting { ref mut next, .. } = self.queue[current] {
                             if *next == key {
                                 *next = next_slot;
                                 break;
