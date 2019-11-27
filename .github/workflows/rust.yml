@@ -1,0 +1,40 @@
+name: Rust
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [stable, beta, nightly]
+
+    steps:
+      - uses: actions/checkout@v1
+      - name: Install ${{ matrix.rust }}
+        uses: actions-rs/toolchain@v1.0.3
+        with:
+          toolchain: ${{ matrix.rust }}
+          override: true
+      - name: Build
+        run: cargo build
+      - name: Test
+        run: cargo test --all
+    
+  lints:
+    name: Check format and clippy lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+      - uses: actions-rs/toolchain@v1.0.3
+        with:
+          toochain: stable
+          override: true
+          profile: minimal
+          components: rustfmt,clippy
+      - name: Check format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy
+    
