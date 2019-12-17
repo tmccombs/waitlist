@@ -231,7 +231,6 @@ impl Inner {
         self.insert(waker)
     }
 
-    #[cold]
     fn remove(&mut self, key: usize) -> bool {
         if self.is_in_waiting_range(key) {
             if let Some(idx) = self.queue.iter().position(|w| w.key == key) {
@@ -320,5 +319,35 @@ impl<'a> Drop for Guard<'a> {
 
         // Synchronise with `lock()`.
         self.waitlist.flags.store(flags, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use futures_task::noop_waker;
+
+    #[test]
+    fn wraparound() {
+        const KEY_START: usize = usize::max_value() - 1;
+        let mut inner = Inner {
+            queue: VecDeque::new(),
+            notified_count: 0,
+            min_key: KEY_START,
+            next_key: KEY_START,
+        };
+
+        inner.insert(noop_waker());
+        let k2 = inner.insert(noop_waker());
+        let k3 = inner.insert(noop_waker());
+        assert_eq!(0, k3);
+        assert_eq!(1, inner.next_key);
+        assert!(inner.notify_first());
+        assert_eq!(usize::max_value(), inner.min_key);
+        assert!(inner.is_in_waiting_range(k2));
+        assert!(inner.is_in_waiting_range(k3));
+        assert_eq!(0, inner.update(0, noop_waker()));
+        assert!(!inner.remove(0));
+        assert!(!inner.remove(k2));
     }
 }

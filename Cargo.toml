@@ -9,3 +9,6 @@ categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 crossbeam-utils = "0.7.0"
+
+[dev-dependencies]
+futures-task = "0.3"
