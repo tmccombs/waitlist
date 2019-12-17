@@ -1,3 +1,7 @@
+[![Coverage Status](https://coveralls.io/repos/github/tmccombs/waitlist/badge.svg?branch=master)](https://coveralls.io/github/tmccombs/waitlist?branch=master)
+[![Build Status](https://github.com/tmccombs/waitlist/workflows/Rust/badge.svg)](https://github.com/tmccombs/waitlist/actions?query=workflow%3ARust+branch%3Amaster)
+
+
 # Waitlist
 
 In Rust async programming it is somewhat common to need to keep track of a set of `Waker`s that should be notified when something happens. This is useful for implementing many synchronization abstractions including mutexes, channels, condition variables, etc. This library provides an implementation of a queue of `Waker`s, that can be used for this purpose.
