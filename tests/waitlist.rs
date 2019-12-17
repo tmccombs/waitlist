@@ -117,3 +117,25 @@ fn notify_after_clearing() {
     assert!(waitlist.notify_one());
     assert_eq!(2, w2.notified_count());
 }
+
+#[test]
+fn update() {
+    let waitlist = Waitlist::new();
+
+    let w1 = MockWaker::new();
+    let mut k1 = waitlist.insert(&w1.to_context());
+    let w2 = MockWaker::new();
+    k1.update(&w2.to_context());
+    waitlist.notify_all();
+    assert_eq!(0, w1.notified_count());
+    assert_eq!(1, w2.notified_count());
+    k1.update(&w1.to_context());
+    waitlist.notify_all();
+    assert_eq!(1, w1.notified_count());
+
+    let _k2 = waitlist.insert(&MockWaker::new().to_context());
+    let _k3 = waitlist.insert(&MockWaker::new().to_context());
+    k1.update(&w2.to_context());
+    waitlist.notify_all();
+    assert_eq!(2, w2.notified_count());
+}
