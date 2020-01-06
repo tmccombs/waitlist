@@ -1,16 +1,12 @@
-use core::cell::UnsafeCell;
-use core::future::Future;
-use core::mem;
-use core::ops::{Deref, DerefMut};
-use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use core::task::{Context, Poll, Waker};
-
-extern crate alloc;
-use alloc::collections::vec_deque::VecDeque;
-use alloc::fmt;
-
-use crossbeam_utils::Backoff;
+use std::collections::vec_deque::VecDeque;
+use std::fmt;
+use std::future::Future;
+use std::mem;
+use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use std::task::{Context, Poll, Waker};
 
 struct Waiter {
     key: usize,
@@ -24,9 +20,6 @@ struct Inner {
     next_key: usize,
 }
 
-// Set when the queue is locked.
-const LOCKED: usize = 1;
-
 // Set when there is at least one notifiable waker
 const WAITING: usize = 1 << 1;
 
@@ -38,7 +31,7 @@ const NOTIFIED: usize = 1 << 2;
  */
 pub struct Waitlist {
     flags: AtomicUsize,
-    inner: UnsafeCell<Inner>,
+    inner: Mutex<Inner>,
 }
 
 pub struct WaitRef<'a> {
@@ -61,7 +54,7 @@ impl Waitlist {
     pub fn with_capacity(cap: usize) -> Waitlist {
         Waitlist {
             flags: AtomicUsize::new(0),
-            inner: UnsafeCell::new(Inner {
+            inner: Mutex::new(Inner {
                 queue: VecDeque::with_capacity(cap),
                 notified_count: 0,
                 min_key: 0,
@@ -71,11 +64,10 @@ impl Waitlist {
     }
 
     fn lock(&self) -> Guard<'_> {
-        let backoff = Backoff::new();
-        while self.flags.fetch_or(LOCKED, Ordering::Acquire) & LOCKED != 0 {
-            backoff.snooze();
+        Guard {
+            flags: &self.flags,
+            inner: self.inner.lock().unwrap()
         }
-        Guard { waitlist: self }
     }
 
     #[inline]
@@ -286,7 +278,8 @@ impl Inner {
 }
 
 struct Guard<'a> {
-    waitlist: &'a Waitlist,
+    flags: &'a AtomicUsize,
+    inner: MutexGuard<'a, Inner>,
 }
 
 impl<'a> Deref for Guard<'a> {
@@ -294,14 +287,14 @@ impl<'a> Deref for Guard<'a> {
 
     #[inline]
     fn deref(&self) -> &Inner {
-        unsafe { &*self.waitlist.inner.get() }
+        &*self.inner
     }
 }
 
 impl<'a> DerefMut for Guard<'a> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Inner {
-        unsafe { &mut *self.waitlist.inner.get() }
+        &mut *self.inner
     }
 }
 
@@ -317,8 +310,9 @@ impl<'a> Drop for Guard<'a> {
             flags |= NOTIFIED;
         }
 
-        // Synchronise with `lock()`.
-        self.waitlist.flags.store(flags, Ordering::SeqCst);
+        // Update flags. Use relaxed ordering because
+        // releasing the mutex will create a memory boundary.
+        self.flags.store(flags, Ordering::Relaxed);
     }
 }
 
