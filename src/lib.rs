@@ -66,7 +66,7 @@ impl Waitlist {
     fn lock(&self) -> Guard<'_> {
         Guard {
             flags: &self.flags,
-            inner: self.inner.lock().unwrap()
+            inner: self.inner.lock().unwrap(),
         }
     }
 
