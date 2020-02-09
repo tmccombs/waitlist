@@ -155,6 +155,26 @@ impl<'a> WaitRef<'a> {
         mem::forget(self); // forget so we don't try removing it again
         did_notify
     }
+
+    pub fn into_key(self) -> usize {
+        let key = self.key;
+        mem::forget(self);
+        key
+    }
+
+    // should this be unsafe?
+    /// Create a `WaitRef` for a `Waitlist` using a key that was previously acquired from
+    /// `into_key`.
+    ///
+    /// For this to work as expected, `key` should be a key returned by a previous call to `into_key`
+    /// on a `WaitRef` that was created from the same `waitlist`. This takes ownership of the wait
+    /// entry for this key.
+    ///
+    /// You should avoid using this if possible, but in some cases it is necessary to avoid
+    /// self-reference.
+    pub fn from_key(waitlist: &Waitlist, key: usize) -> WaitRef<'_> {
+        WaitRef { waitlist, key }
+    }
 }
 
 impl<'a> Drop for WaitRef<'a> {
@@ -219,7 +239,7 @@ impl Inner {
                 return key;
             }
         }
-        self.notified_count -= 1; // the waiter was already notified, so we need to decrement the number actively notified tasks
+        self.notified_count -= 1; // the waiter was already notified, so we need to decrement the number of actively notified tasks
         self.insert(waker)
     }
 
