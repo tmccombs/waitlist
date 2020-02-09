@@ -90,7 +90,7 @@ impl Waitlist {
 
     #[inline]
     pub fn notify_one(&self) -> bool {
-        if self.flags.load(Ordering::SeqCst) & WAITING != 0 {
+        if self.flags.load(Ordering::Relaxed) & WAITING != 0 {
             self.lock().notify_first()
         } else {
             false
@@ -99,7 +99,7 @@ impl Waitlist {
 
     #[inline]
     pub fn notify_all(&self) -> bool {
-        if self.flags.load(Ordering::SeqCst) & WAITING != 0 {
+        if self.flags.load(Ordering::Relaxed) & WAITING != 0 {
             self.lock().notify_all()
         } else {
             false
@@ -108,7 +108,7 @@ impl Waitlist {
 
     #[inline]
     pub fn notify_any(&self) -> bool {
-        let flags = self.flags.load(Ordering::SeqCst);
+        let flags = self.flags.load(Ordering::Relaxed);
         if flags & NOTIFIED == 0 && flags & WAITING != 0 {
             let mut inner = self.lock();
             // We need check the notified_count, because
