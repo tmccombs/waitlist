@@ -6,8 +6,14 @@ mod mock_waker;
 use mock_waker::MockWaker;
 use waitlist::*;
 
-fn add_all<'a>(wl: &'a Waitlist, wakers: &[MockWaker]) -> Vec<WaitRef<'a>> {
-    wakers.iter().map(|w| wl.insert(&w.to_context())).collect()
+fn wait_for_waker<'a>(wl: &'a Waitlist, w: &MockWaker) -> WaitHandle<'a> {
+    let mut handle = wl.wait();
+    handle.set_context(&w.to_context());
+    handle
+}
+
+fn add_all<'a>(wl: &'a Waitlist, wakers: &[MockWaker]) -> Vec<WaitHandle<'a>> {
+    wakers.iter().map(|w| wait_for_waker(wl, w)).collect()
 }
 
 #[test]
@@ -50,15 +56,15 @@ fn notify_all() {
 fn notify_any() {
     let waitlist = Waitlist::new();
     let w1 = MockWaker::new();
-    let k1 = waitlist.insert(&w1.to_context());
+    let mut k1 = wait_for_waker(&waitlist, &w1);
     let w2 = MockWaker::new();
-    let _k2 = waitlist.insert(&w2.to_context());
+    let _k2 = wait_for_waker(&waitlist, &w2);
 
     assert!(waitlist.notify_any());
     assert!(!waitlist.notify_any());
     assert_eq!(1, w1.notified_count());
     assert_eq!(0, w2.notified_count());
-    assert!(k1.remove());
+    assert!(k1.finish());
     assert!(waitlist.notify_any());
     assert_eq!(1, w2.notified_count());
 }
@@ -69,8 +75,8 @@ fn cancel_notifies_next() {
     let w2 = MockWaker::new();
     let waitlist = Waitlist::new();
 
-    let k1 = waitlist.insert(&w1.to_context());
-    let _k2 = waitlist.insert(&w2.to_context());
+    let mut k1 = wait_for_waker(&waitlist, &w1);
+    let _k2 = wait_for_waker(&waitlist, &w2);
 
     waitlist.notify_one();
     assert!(k1.cancel());
@@ -100,20 +106,20 @@ fn wait_waits_until_notified() {
 fn notify_after_clearing() {
     let waitlist = Waitlist::new();
     let w1 = MockWaker::new();
-    let k1 = waitlist.insert(&w1.to_context());
+    let k1 = wait_for_waker(&waitlist, &w1);
     waitlist.notify_one();
     assert_eq!(1, w1.notified_count());
 
-    let _k2 = waitlist.insert(&w1.to_context());
+    let _k2 = wait_for_waker(&waitlist, &w1);
     let w2 = MockWaker::new();
-    let k3 = waitlist.insert(&w2.to_context());
+    let k3 = wait_for_waker(&waitlist, &w2);
     waitlist.notify_all();
 
     assert_eq!(2, w1.notified_count());
     assert_eq!(1, w2.notified_count());
     drop(k1);
     drop(k3);
-    let _k2 = waitlist.insert(&w2.to_context());
+    let _k2 = wait_for_waker(&waitlist, &w2);
     assert!(waitlist.notify_one());
     assert_eq!(2, w2.notified_count());
 }
@@ -123,19 +129,19 @@ fn update() {
     let waitlist = Waitlist::new();
 
     let w1 = MockWaker::new();
-    let mut k1 = waitlist.insert(&w1.to_context());
+    let mut k1 = wait_for_waker(&waitlist, &w1);
     let w2 = MockWaker::new();
-    k1.update(&w2.to_context());
+    k1.set_context(&w2.to_context());
     waitlist.notify_all();
     assert_eq!(0, w1.notified_count());
     assert_eq!(1, w2.notified_count());
-    k1.update(&w1.to_context());
+    k1.set_context(&w1.to_context());
     waitlist.notify_all();
     assert_eq!(1, w1.notified_count());
 
-    let _k2 = waitlist.insert(&MockWaker::new().to_context());
-    let _k3 = waitlist.insert(&MockWaker::new().to_context());
-    k1.update(&w2.to_context());
+    let _k2 = wait_for_waker(&waitlist, &MockWaker::new());
+    let _k3 = wait_for_waker(&waitlist, &MockWaker::new());
+    k1.set_context(&w2.to_context());
     waitlist.notify_all();
     assert_eq!(2, w2.notified_count());
 }

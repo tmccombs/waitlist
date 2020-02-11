@@ -34,12 +34,7 @@ pub struct Waitlist {
     inner: Mutex<Inner>,
 }
 
-pub struct WaitRef<'a> {
-    waitlist: &'a Waitlist,
-    key: usize,
-}
-
-pub struct WaitFuture<'a> {
+pub struct WaitHandle<'a> {
     waitlist: &'a Waitlist,
     key: Option<usize>,
 }
@@ -71,18 +66,8 @@ impl Waitlist {
     }
 
     #[inline]
-    pub fn insert(&self, cx: &Context) -> WaitRef<'_> {
-        let waker = cx.waker().clone();
-        let key = self.lock().insert(waker);
-        WaitRef {
-            waitlist: self,
-            key,
-        }
-    }
-
-    #[inline]
-    pub fn wait(&self) -> WaitFuture<'_> {
-        WaitFuture {
+    pub fn wait(&self) -> WaitHandle<'_> {
+        WaitHandle {
             waitlist: self,
             key: None,
         }
@@ -133,60 +118,85 @@ impl fmt::Debug for Waitlist {
     }
 }
 
-impl<'a> WaitRef<'a> {
+impl WaitHandle<'_> {
+    /// Mark this task as completed.
+    ///
+    /// If this handle still has a waker on the queue,
+    /// remove that waker without triggering another notify
+    /// and return true. Otherwise, return false.
     #[inline]
-    pub fn update(&mut self, cx: &Context) {
-        let waker = cx.waker().clone();
-        self.key = self.waitlist.lock().update(self.key, waker);
+    pub fn finish(&mut self) -> bool {
+        if let Some(key) = self.key.take() {
+            self.waitlist.lock().remove(key)
+        } else {
+            false
+        }
     }
 
-    /// Remove waker associated with this reference from the
-    /// waitlist without triggering another notify.
+    /// Mark that the task was cancelled.
+    ///
+    /// If this handle currently has a waker on the queue and there is
+    /// at least one other task waiting on the queue, remove this waker from the queue,
+    /// wake the next task, and return true. Otherwise return false.
     #[inline]
-    pub fn remove(self) -> bool {
-        let was_notified = self.waitlist.lock().remove(self.key);
-        mem::forget(self); // forget self, because the default is a cancel
-        was_notified
+    pub fn cancel(&mut self) -> bool {
+        if let Some(key) = self.key.take() {
+            self.waitlist.lock().cancel(key)
+        } else {
+            false
+        }
     }
 
     #[inline]
-    pub fn cancel(self) -> bool {
-        let did_notify = self.waitlist.lock().cancel(self.key);
-        mem::forget(self); // forget so we don't try removing it again
-        did_notify
+    pub fn set_context(&mut self, cx: &Context) {
+        let key = if let Some(key) = self.key {
+            self.waitlist.lock().update(key, cx)
+        } else {
+            self.waitlist.lock().insert(cx)
+        };
+        self.key = Some(key);
     }
 
-    pub fn into_key(self) -> usize {
+    /// Return true if the WaitHandle has been polled at least once, and has not been
+    /// completed (by calling either `finish` or `cancel`).
+    pub fn is_pending(&self) -> bool {
+        self.key.is_some()
+    }
+
+    pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if let Some(key) = self.key {
+            if self.waitlist.lock().remove_if_notified(key, cx) {
+                self.key = None;
+                return Poll::Ready(());
+            }
+        } else {
+            self.key = Some(self.waitlist.lock().insert(cx));
+        }
+        Poll::Pending
+    }
+
+    pub fn into_key(self) -> Option<usize> {
         let key = self.key;
         mem::forget(self);
         key
     }
 
     // should this be unsafe?
-    /// Create a `WaitRef` for a `Waitlist` using a key that was previously acquired from
+    /// Create a `WaitHandle` for a `Waitlist` using a key that was previously acquired from
     /// `into_key`.
     ///
     /// For this to work as expected, `key` should be a key returned by a previous call to `into_key`
-    /// on a `WaitRef` that was created from the same `waitlist`. This takes ownership of the wait
+    /// on a `WaitHandle` that was created from the same `waitlist`. This takes ownership of the wait
     /// entry for this key.
     ///
     /// You should avoid using this if possible, but in some cases it is necessary to avoid
     /// self-reference.
-    pub fn from_key(waitlist: &Waitlist, key: usize) -> WaitRef<'_> {
-        WaitRef { waitlist, key }
+    pub fn from_key(waitlist: &Waitlist, key: Option<usize>) -> WaitHandle<'_> {
+        WaitHandle { waitlist, key }
     }
 }
 
-impl<'a> Drop for WaitRef<'a> {
-    #[inline]
-    fn drop(&mut self) {
-        // by default dropping a WaitRef will cancel,
-        // triggering another waker if necessary
-        self.waitlist.lock().cancel(self.key);
-    }
-}
-
-impl<'a> Future for WaitFuture<'a> {
+impl<'a> Future for WaitHandle<'a> {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(key) = self.key {
@@ -195,14 +205,13 @@ impl<'a> Future for WaitFuture<'a> {
                 return Poll::Ready(());
             }
         } else {
-            let waker = cx.waker().clone();
-            self.key = Some(self.waitlist.lock().insert(waker));
+            self.key = Some(self.waitlist.lock().insert(cx));
         }
         Poll::Pending
     }
 }
 
-impl<'a> Drop for WaitFuture<'a> {
+impl<'a> Drop for WaitHandle<'a> {
     fn drop(&mut self) {
         if let Some(key) = self.key {
             self.waitlist.lock().cancel(key);
@@ -225,22 +234,23 @@ impl Inner {
         key >= self.min_key || (self.next_key < self.min_key && key < self.next_key)
     }
 
-    fn insert(&mut self, waker: Waker) -> usize {
+    fn insert(&mut self, cx: &Context<'_>) -> usize {
         let key = self.next_key;
+        let waker = cx.waker().clone();
         self.next_key = self.next_key.wrapping_add(1);
         self.queue.push_back(Waiter { key, waker });
         key
     }
 
-    fn update(&mut self, key: usize, waker: Waker) -> usize {
+    fn update(&mut self, key: usize, cx: &Context<'_>) -> usize {
         if self.is_in_waiting_range(key) {
             if let Some(w) = self.queue.iter_mut().find(|w| w.key == key) {
-                w.waker = waker;
+                w.waker = cx.waker().clone();
                 return key;
             }
         }
         self.notified_count -= 1; // the waiter was already notified, so we need to decrement the number of actively notified tasks
-        self.insert(waker)
+        self.insert(cx)
     }
 
     fn remove(&mut self, key: usize) -> bool {
@@ -351,16 +361,19 @@ mod test {
             next_key: KEY_START,
         };
 
-        inner.insert(noop_waker());
-        let k2 = inner.insert(noop_waker());
-        let k3 = inner.insert(noop_waker());
+        let waker = noop_waker();
+        let context = Context::from_waker(&waker);
+
+        inner.insert(&context);
+        let k2 = inner.insert(&context);
+        let k3 = inner.insert(&context);
         assert_eq!(0, k3);
         assert_eq!(1, inner.next_key);
         assert!(inner.notify_first());
         assert_eq!(usize::max_value(), inner.min_key);
         assert!(inner.is_in_waiting_range(k2));
         assert!(inner.is_in_waiting_range(k3));
-        assert_eq!(0, inner.update(0, noop_waker()));
+        assert_eq!(0, inner.update(0, &context));
         assert!(!inner.remove(0));
         assert!(!inner.remove(k2));
     }
