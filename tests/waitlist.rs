@@ -1,6 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
-
 mod mock_waker;
 
 use mock_waker::MockWaker;
@@ -84,22 +81,21 @@ fn cancel_notifies_next() {
 }
 
 #[test]
-fn wait_waits_until_notified() {
+fn try_finish_works() {
     let waitlist = Waitlist::new();
     let waker = MockWaker::new();
     let mut cx = waker.to_context();
     let mut waiter = waitlist.wait();
-    let mut wait_fut = Pin::new(&mut waiter);
 
-    assert!(wait_fut.as_mut().poll(&mut cx).is_pending());
-    assert!(wait_fut.as_mut().poll(&mut cx).is_pending());
-    waitlist.notify_one();
-    assert!(wait_fut.as_mut().poll(&mut cx).is_ready());
+    waiter.set_context(&mut cx); // start waiting
 
-    // after finishing, we should get it in pending state again
-    assert!(wait_fut.as_mut().poll(&mut cx).is_pending());
+    assert!(!waiter.try_finish(&mut cx));
+    assert!(!waiter.try_finish(&mut cx));
     waitlist.notify_one();
-    assert!(wait_fut.as_mut().poll(&mut cx).is_ready());
+    assert!(waiter.try_finish(&mut cx));
+
+    // after finishing, it should continue to return true
+    assert!(waiter.try_finish(&mut cx));
 }
 
 #[test]

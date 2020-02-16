@@ -1,12 +1,10 @@
 use std::collections::vec_deque::VecDeque;
 use std::fmt;
-use std::future::Future;
 use std::mem;
 use std::ops::{Deref, DerefMut};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Waker};
 
 struct Waiter {
     key: usize,
@@ -163,16 +161,32 @@ impl WaitHandle<'_> {
         self.key.is_some()
     }
 
-    pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    /// Mark as finished if this was notified, otherwise update the context.
+    ///
+    /// This is roughly equivalent to
+    ///
+    /// ```no_run
+    /// # let waitlist = waitlist::Waitlist::new();
+    /// # let mut handle = waitlist.wait();
+    /// # let waker = futures_task::noop_waker();
+    /// # let cx = std::task::Context::from_waker(&waker);
+    /// let did_finish = if handle.finish() {
+    ///   handle.set_context(&cx);
+    ///   false
+    /// } else {
+    ///   true
+    /// };
+    /// ```
+    /// but operates atomically on the waitlist.
+    pub fn try_finish(&mut self, cx: &mut Context<'_>) -> bool {
         if let Some(key) = self.key {
-            if self.waitlist.lock().remove_if_notified(key, cx) {
+            if self.waitlist.lock().update_if_pending(key, cx) {
+                return false;
+            } else {
                 self.key = None;
-                return Poll::Ready(());
             }
-        } else {
-            self.key = Some(self.waitlist.lock().insert(cx));
         }
-        Poll::Pending
+        true
     }
 
     pub fn into_key(self) -> Option<usize> {
@@ -193,21 +207,6 @@ impl WaitHandle<'_> {
     /// self-reference.
     pub fn from_key(waitlist: &Waitlist, key: Option<usize>) -> WaitHandle<'_> {
         WaitHandle { waitlist, key }
-    }
-}
-
-impl<'a> Future for WaitHandle<'a> {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(key) = self.key {
-            if self.waitlist.lock().remove_if_notified(key, cx) {
-                self.key = None;
-                return Poll::Ready(());
-            }
-        } else {
-            self.key = Some(self.waitlist.lock().insert(cx));
-        }
-        Poll::Pending
     }
 }
 
@@ -272,16 +271,23 @@ impl Inner {
         }
     }
 
-    fn remove_if_notified(&mut self, key: usize, cx: &Context<'_>) -> bool {
+    /// Update the waker for the task for `key`, but only if it is still waiting to
+    /// be woken.
+    ///
+    /// Return true if a waker was updated, false, if no waiting task was found.
+    ///
+    /// If no waker was updated decrement the notified_count to mark that one of the notified tasks
+    /// has been handled.
+    fn update_if_pending(&mut self, key: usize, cx: &Context<'_>) -> bool {
         // all we really need to do here is decrement notified_count if the key isn't in the queue
         if self.is_in_waiting_range(key) {
             if let Some(w) = self.queue.iter_mut().find(|w| w.key == key) {
                 w.waker = cx.waker().clone();
-                return false;
+                return true;
             }
         }
         self.notified_count -= 1;
-        true
+        false
     }
 
     fn notify_first(&mut self) -> bool {
