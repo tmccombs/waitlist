@@ -1,5 +1,6 @@
 [package]
 name = "waitlist"
+description = "Keep track of an ordered list of Wakers to wake"
 version = "0.1.0"
 authors = ["Thayne McCombs <astrothayne@gmail.com>"]
 edition = "2018"
