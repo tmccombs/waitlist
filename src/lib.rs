@@ -323,14 +323,14 @@ impl<'a> Deref for Guard<'a> {
 
     #[inline]
     fn deref(&self) -> &Inner {
-        &*self.inner
+        &self.inner
     }
 }
 
 impl<'a> DerefMut for Guard<'a> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Inner {
-        &mut *self.inner
+        &mut self.inner
     }
 }
 
