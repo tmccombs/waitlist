@@ -25,24 +25,31 @@ const WAITING: usize = 1 << 1;
 // yet been removed
 const NOTIFIED: usize = 1 << 2;
 
-/**
- */
+/// An ordered list of [`std::task::Waker`]s.
+///
+/// This allows waking wakers in the same order that they were added to this queue.
 pub struct Waitlist {
     flags: AtomicUsize,
     inner: Mutex<Inner>,
 }
 
+/// Handle for controlling the wait status of a task.
 pub struct WaitHandle<'a> {
     waitlist: &'a Waitlist,
     key: Option<usize>,
 }
 
 impl Waitlist {
+
+    /// Create a new `Waitlist`
     #[inline]
     pub fn new() -> Waitlist {
         Self::with_capacity(0)
     }
 
+    /// Create a new waitlist with a given initial capacity
+    ///
+    /// This determines how much capacity the underlying `Vec` should be created with.
     #[inline]
     pub fn with_capacity(cap: usize) -> Waitlist {
         Waitlist {
@@ -56,6 +63,7 @@ impl Waitlist {
         }
     }
 
+    /// Lock `inner`, and give a new guard that includes the atomic flags
     fn lock(&self) -> Guard<'_> {
         Guard {
             flags: &self.flags,
@@ -63,6 +71,12 @@ impl Waitlist {
         }
     }
 
+    /// Return a handle a task can use to wait for events
+    ///
+    /// Calling this method doesn't do anything itself, but gives you an object
+    /// that you can then call [`WaitHandle::set_context`] on to attach a polling context to the task so
+    /// that it is notified when one of the `notify_*` methods is called. It is also used to mark
+    /// the the task as done or canceled.
     #[inline]
     pub fn wait(&self) -> WaitHandle<'_> {
         WaitHandle {
@@ -71,6 +85,10 @@ impl Waitlist {
         }
     }
 
+    /// Wake the first waker in the queue
+    ///
+    /// Returns true if a waker was woken and false if no task was woken (that is, the queue
+    /// was empty).
     #[inline]
     pub fn notify_one(&self) -> bool {
         if self.flags.load(Ordering::Relaxed) & WAITING != 0 {
@@ -80,6 +98,9 @@ impl Waitlist {
         }
     }
 
+    /// Wake all wakers in the queue
+    ///
+    /// Returns true if at least one waker was woken. False otherwise.
     #[inline]
     pub fn notify_all(&self) -> bool {
         if self.flags.load(Ordering::Relaxed) & WAITING != 0 {
@@ -89,6 +110,11 @@ impl Waitlist {
         }
     }
 
+    /// Wake the next waker, unless it has already been notified.
+    ///
+    /// This ensures that at least one waker has been notified, but avoid waking
+    /// multiple wakers if multiple events occur before the first task has marked the
+    /// handle as completed.
     #[inline]
     pub fn notify_any(&self) -> bool {
         let flags = self.flags.load(Ordering::Relaxed);
@@ -189,6 +215,7 @@ impl WaitHandle<'_> {
         true
     }
 
+    /// Convert into a key that can later be used with `from_key` to convert back into a `WaitHandle`.
     pub fn into_key(self) -> Option<usize> {
         let key = self.key;
         mem::forget(self);
