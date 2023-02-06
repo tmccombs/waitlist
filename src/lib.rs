@@ -40,7 +40,6 @@ pub struct WaitHandle<'a> {
 }
 
 impl Waitlist {
-
     /// Create a new `Waitlist`
     #[inline]
     pub fn new() -> Waitlist {
